@@ -22,7 +22,7 @@ CUDA_SHA256_DIR:=cuda-sha256
 
 CFLAGS+=-DENDIAN_NEUTRAL -DLTC_NO_ASM -I$(CUDA_HEADER_DIR) -I$(CUDA_SHA256_DIR)
 
-all: $V/$(ECC_SCAN_BIN) $(V)/lib$(LIB).so
+all: $V/$(ECC_SCAN_BIN) $(V)/lib$(LIB).so ../run_vanity.sh
 
 ECC_DIR:=cuda-ecc-ed25519
 
@@ -94,6 +94,15 @@ $V/ecc_scan.o: $(addprefix $(ECC_DIR)/,vanity.cu ed25519.h)
 
 $V/$(ECC_SCAN_BIN): $V/ecc_scan.o $V/lib$(LIB).so
 	$(NVCC) $(CFLAGS) -L$V -l$(LIB) $< -o $@
+
+../run_vanity.sh:
+	@echo "Creating run_vanity.sh"
+	@echo '#!/bin/bash' > ../run_vanity.sh
+	@echo 'SCRIPT_DIR="$$(cd "$$(dirname "$${BASH_SOURCE[0]}")/src/release" && pwd)"' >> ../run_vanity.sh
+	@echo 'export LD_LIBRARY_PATH="$$SCRIPT_DIR:$$LD_LIBRARY_PATH"' >> ../run_vanity.sh
+	@echo '"$$SCRIPT_DIR/$(ECC_SCAN_BIN)" "$$@"' >> ../run_vanity.sh
+	@chmod +x ../run_vanity.sh
+	@echo "run_vanity.sh created"
 
 .PHONY:clean
 clean:
