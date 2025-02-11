@@ -33,7 +33,7 @@ void            vanity_setup(config& vanity);
 void            vanity_run(config& vanity);
 void __global__ vanity_init(unsigned long long int* seed, curandState* state);
 void __global__ vanity_scan(curandState* state, int* gpu, int* exec_count, int* keys_found, int* resultCount, KeyRecord* results);
-bool __device__ b58enc(char* b58, size_t* b58sz, uint8_t* data, size_t binsz);
+__device__ bool b58enc(char* b58, size_t* b58sz, const uint8_t* data, size_t binsz);
 
 /* -- Pattern Matching Functions -------------------------------------------- */
 
@@ -73,29 +73,6 @@ __device__ bool check_starts_and_ends_with(const char* address, const char* star
     return check_starts_with(address, start_pattern) && check_ends_with(address, end_pattern);
 }
 
-__device__ bool check_contains_mnemonic(const char* address) {
-    for (int i = 0; i < sizeof(mnemonic_words) / sizeof(mnemonic_words[0]); i++) {
-        const char* word = mnemonic_words[i];
-        const char* found = address;
-        while (*found) {
-            bool match = true;
-            const char* w = word;
-            const char* f = found;
-            while (*w) {
-                if (*w != *f) {
-                    match = false;
-                    break;
-                }
-                w++;
-                f++;
-            }
-            if (match) return true;
-            found++;
-        }
-    }
-    return false;
-}
-
 __device__ bool check_pattern(const char* address, const pattern_t* pattern) {
     switch (pattern->type) {
         case PATTERN_TYPE_STARTS_WITH:
@@ -106,9 +83,6 @@ __device__ bool check_pattern(const char* address, const pattern_t* pattern) {
             
         case PATTERN_TYPE_STARTS_AND_ENDS_WITH:
             return check_starts_and_ends_with(address, pattern->pattern, pattern->end_pattern);
-            
-        case PATTERN_TYPE_MNEMONIC:
-            return check_contains_mnemonic(address);
             
         default:
             return false;
@@ -150,6 +124,7 @@ unsigned long long int makeSeed() {
 }
 
 /* -- Vanity Setup Function ------------------------------------------------- */
+
 void vanity_setup(config &vanity) {
     printf("GPU: Initializing Memory\n");
     int gpuCount = 0;
@@ -203,10 +178,11 @@ void vanity_run(config &vanity) {
         unsigned long long executions_this_iteration = 0;
         unsigned long long keys_found_this_iteration = 0;
 
-        // Launch a kernel on each GPU.
+        // For each GPU in the iteration:
         for (int g = 0; g < gpuCount; ++g) {
             cudaSetDevice(g);
 
+            // Compute grid and block sizes for the kernel.
             int blockSize = 0, minGridSize = 0, maxActiveBlocksPerSM = 0;
             cudaOccupancyMaxPotentialBlockSize(&minGridSize, &blockSize, vanity_scan, 0, 0);
             cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxActiveBlocksPerSM, vanity_scan, blockSize, 0);
@@ -214,7 +190,15 @@ void vanity_run(config &vanity) {
             cudaGetDeviceProperties(&devProp, g);
             int totalBlocks = maxActiveBlocksPerSM * devProp.multiProcessorCount;
 
-            // Allocate a device int for GPU id.
+            // Reseed the curand state on this GPU.
+            unsigned long long int new_seed = makeSeed();
+            unsigned long long int* dev_new_seed = nullptr;
+            cudaMalloc((void**)&dev_new_seed, sizeof(unsigned long long int));
+            cudaMemcpy(dev_new_seed, &new_seed, sizeof(unsigned long long int), cudaMemcpyHostToDevice);
+            vanity_init<<<totalBlocks, blockSize>>>(dev_new_seed, vanity.states[g]);
+            cudaFree(dev_new_seed);
+
+            // Allocate a device int for the GPU id.
             int* dev_g = nullptr;
             cudaMalloc((void**)&dev_g, sizeof(int));
             cudaMemcpy(dev_g, &g, sizeof(int), cudaMemcpyHostToDevice);
@@ -240,6 +224,7 @@ void vanity_run(config &vanity) {
                                                       dev_results[g]);
             cudaFree(dev_g);
         }
+
 
         // Wait for all kernels to complete.
         cudaDeviceSynchronize();
@@ -287,7 +272,6 @@ void vanity_run(config &vanity) {
 
 __global__ void vanity_init(unsigned long long int* rseed, curandState* state) {
     int id = threadIdx.x + blockIdx.x * blockDim.x;
-    // Instead of using *rseed for every thread, add the thread id:
     curand_init(*rseed + id, id, 0, &state[id]);
 }
 
@@ -298,38 +282,48 @@ __global__ void vanity_scan(curandState* state,
                               int* resultCount,     // Atomic counter for results
                               KeyRecord* results)   // Global array for matching keys
 {
+    // Calculate unique thread id.
     int id = threadIdx.x + blockIdx.x * blockDim.x;
     atomicAdd(exec_count, 1);
+    
+    // Get the thread's random state.
+    curandState localState = state[id];
 
-    // Determine number of patterns and compute each pattern’s length.
+    // ---------------------------------------------------------------
+    // Generate a high-entropy base seed unique to this thread.
+    // We mix in the thread id so different threads cover different regions.
+    // ---------------------------------------------------------------
+    unsigned char seed[32];
+    for (int i = 0; i < 32; i++) {
+        // Mix a random byte from curand with some bits from the thread id.
+        seed[i] = (uint8_t)(curand(&localState) & 0xFF) ^ ((id >> (i % 8)) & 0xFF);
+    }
+    
+    // Prepare a constant “one” that will be added to the seed each attempt.
+    // (This is our deterministic step: simply add 1 as a big-integer.)
+    unsigned char one[32] = {0};
+    one[31] = 1;  // least significant byte = 1
+
+    ge_p3 A;
+    unsigned char publick[32];
+    unsigned char privatek[64];
+    char key[KEY_STRING_SIZE];
+
+    // Determine number of patterns (assume patterns and MAX_PATTERNS are defined)
     int numPatterns = sizeof(patterns) / sizeof(pattern_t);
     int prefix_letter_counts[MAX_PATTERNS];
     for (int p = 0; p < numPatterns; p++) {
         int count = 0;
-        while (patterns[p].pattern[count] != '\0') {
-            count++;
-        }
+        while (patterns[p].pattern[count] != '\0') count++;
         prefix_letter_counts[p] = count;
     }
-
-    // Local ED25519 state and random variables.
-    ge_p3 A;
-    curandState localState = state[id];
-    unsigned char seed[32] = {0};
-    unsigned char publick[32] = {0};
-    unsigned char privatek[64] = {0};
-    char key[KEY_STRING_SIZE] = {0};
-
-    // Initialize the seed from curand and mix in the thread id.
-    for (int i = 0; i < 32; ++i) {
-        float rnd = curand_uniform(&localState);
-        // Multiply by 255 to scale to 0..255, then XOR in part of the thread id.
-        seed[i] = ((uint8_t)(rnd * 255)) ^ ((id >> (i % 8)) & 0xFF);
-    }
-
-    // Main loop: try ATTEMPTS_PER_EXECUTION times.
+    
+    // ------------------------------------------------------------------
+    // Now, in each iteration we derive keys based on the current seed.
+    // Then we increment the seed deterministically to cover the space.
+    // ------------------------------------------------------------------
     for (int attempt = 0; attempt < ATTEMPTS_PER_EXECUTION; ++attempt) {
-        // Derive key data via SHA512.
+        // Derive the 64-byte hash from the 32-byte seed.
         sha512_context md;
         sha512_init(&md);
         sha512_update(&md, seed, 32);
@@ -358,17 +352,16 @@ __global__ void vanity_scan(curandState* state,
                 }
             }
             if (match) {
-                // A match was found.
+                // If we have a match, update counters and record the result.
                 atomicAdd(keys_found, 1);
                 int index = atomicAdd(resultCount, 1);
-                // Copy the Base58 address and the seed into results.
                 for (int j = 0; j < KEY_STRING_SIZE; j++) {
                     results[index].key[j] = key[j];
                 }
                 for (int j = 0; j < SEED_SIZE; j++) {
                     results[index].seed[j] = seed[j];
                 }
-                // Build the full 64-byte private key: first 32 bytes = seed, next 32 = public key.
+                // Build the full 64-byte private key:
                 unsigned char fullPrivate[64];
                 for (int n = 0; n < SEED_SIZE; n++) {
                     fullPrivate[n] = seed[n];
@@ -376,57 +369,49 @@ __global__ void vanity_scan(curandState* state,
                 for (int n = 0; n < 32; n++) {
                     fullPrivate[n + SEED_SIZE] = publick[n];
                 }
-                // Print the result in JSON format with no extra whitespace.
+                // Print the result in JSON format.
                 printf("{\"address\":\"%s\",\"private_key\":[", key);
                 for (int n = 0; n < 64; n++) {
                     printf("%d", fullPrivate[n]);
-                    if (n < 63) {
-                        printf(",");
-                    }
+                    if (n < 63) { printf(","); }
                 }
                 printf("]}\n");
                 break; // Stop checking further patterns for this attempt.
             }
         }
-
-        // Increment seed using a simple counter (note: this is not secure for production)
-        for (int i = 0; i < 32; ++i) {
-            if (seed[i] == 255)
-                seed[i] = 0;
-            else {
-                seed[i] += 1;
-                break;
-            }
+        
+        // Increment the seed as a big-integer (seed = seed + 1).
+        int carry = 0;
+        for (int i = 31; i >= 0; i--) {
+            int sum = (int)seed[i] + (int)one[i] + carry;
+            seed[i] = (unsigned char)(sum & 0xFF);
+            carry = sum >> 8;
         }
     }
-
-    // Write back the updated random state.
+    
+    // Write back the updated curand state.
     state[id] = localState;
 }
 
-bool __device__ b58enc(char* b58, size_t* b58sz, uint8_t* data, size_t binsz) {
-    const char b58digits_ordered[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+__device__ bool b58enc(char* b58, size_t* b58sz, const uint8_t* data, size_t binsz) {
+    static const char b58digits_ordered[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
-    const uint8_t* bin = data;
     int carry;
     size_t i, j, high, zcount = 0;
-    size_t size;
-    
-    while (zcount < binsz && !bin[zcount])
+    size_t size = (binsz * 138 / 100) + 1;
+    uint8_t buf[256] = {0}; // Initialize to zero directly.
+
+    while (zcount < binsz && !data[zcount])
         ++zcount;
     
-    size = (binsz - zcount) * 138 / 100 + 1;
-    uint8_t buf[256];
-    memset(buf, 0, size);
+    size -= zcount; // Adjust size for leading zeros.
     
     for (i = zcount, high = size - 1; i < binsz; ++i, high = j) {
-        for (carry = bin[i], j = size - 1; (j > high) || carry; --j) {
+        carry = data[i];
+        for (j = size - 1; j > high || carry; --j) {
             carry += 256 * buf[j];
             buf[j] = carry % 58;
             carry /= 58;
-            if (!j) {
-                break;
-            }
         }
     }
     
@@ -438,7 +423,9 @@ bool __device__ b58enc(char* b58, size_t* b58sz, uint8_t* data, size_t binsz) {
     }
     
     if (zcount) memset(b58, '1', zcount);
-    for (i = zcount; j < size; ++i, ++j) b58[i] = b58digits_ordered[buf[j]];
+    for (i = zcount; j < size; ++i, ++j) {
+        b58[i] = b58digits_ordered[buf[j]];
+    }
     b58[i] = '\0';
     *b58sz = i + 1;
     
