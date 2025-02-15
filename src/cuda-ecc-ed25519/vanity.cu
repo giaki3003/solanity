@@ -33,7 +33,7 @@ void            vanity_setup(config& vanity);
 void            vanity_run(config& vanity);
 void __global__ vanity_init(unsigned long long int* seed, curandState* state);
 void __global__ vanity_scan(curandState* state, int* gpu, int* exec_count, int* keys_found, int* resultCount, KeyRecord* results);
-__device__ bool b58enc(char* b58, size_t* b58sz, const uint8_t* data, size_t binsz);
+__device__ bool b58enc_optimized(char* b58, size_t* b58sz, const uint8_t* data, size_t binsz);
 
 /* -- Pattern Matching Functions -------------------------------------------- */
 
@@ -378,7 +378,7 @@ __global__ void vanity_scan(curandState* state,
 
         // Convert the public key to a Base58-encoded address.
         size_t keysize = KEY_STRING_SIZE;
-        bool success = b58enc(key, &keysize, publick, 32);
+        bool success = b58enc_optimized(key, &keysize, publick, 32);
         if (!success) {
             printf("b58enc failed, required buffer size: %zu\n", keysize);
         }
@@ -427,25 +427,23 @@ __global__ void vanity_scan(curandState* state,
     state[id] = localState;
 }
 
-__device__ bool b58enc(char* b58, size_t* b58sz, const uint8_t* data, size_t binsz) {
+__device__ bool b58enc_optimized(char* b58, size_t* b58sz, const uint8_t* data, size_t binsz) {
     static const char b58digits_ordered[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-
-    int carry;
+    uint32_t carry;
+    uint8_t buf[256] = {0};
     size_t i, j, high, zcount = 0;
-    size_t size = (binsz * 138 / 100) + 1;
-    uint8_t buf[256] = {0}; // Initialize to zero directly.
-
-    while (zcount < binsz && !data[zcount])
-        ++zcount;
     
-    size -= zcount; // Adjust size for leading zeros.
+    while (zcount < binsz && !data[zcount]) ++zcount;
+    const size_t size = (binsz * 138 / 100) + 1 - zcount;
     
     for (i = zcount, high = size - 1; i < binsz; ++i, high = j) {
         carry = data[i];
-        for (j = size - 1; j > high || carry; --j) {
-            carry += 256 * buf[j];
-            buf[j] = carry % 58;
-            carry /= 58;
+        for (j = size - 1; (j > high) || carry; --j) {
+            carry += (uint32_t)buf[j] << 8;
+            const uint64_t product = carry * 0x8D3DCB09ULL;
+            const uint32_t div = (uint32_t)(product >> 37);
+            buf[j] = carry - div * 58;
+            carry = div;
         }
     }
     
@@ -457,11 +455,10 @@ __device__ bool b58enc(char* b58, size_t* b58sz, const uint8_t* data, size_t bin
     }
     
     if (zcount) memset(b58, '1', zcount);
-    for (i = zcount; j < size; ++i, ++j) {
+    for (i = zcount; j < size; ++i, ++j)
         b58[i] = b58digits_ordered[buf[j]];
-    }
+    
     b58[i] = '\0';
     *b58sz = i + 1;
-    
     return true;
 }
